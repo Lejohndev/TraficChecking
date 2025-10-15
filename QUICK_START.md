@@ -4,8 +4,9 @@
 
 ```bash
 # 1. Cài đặt dependencies
+pip install opencv-python
 pip install -r requirements.txt
-
+pip install ultralytics torch torchvision
 # 2. Tạo video demo
 python run_demo.py
 
