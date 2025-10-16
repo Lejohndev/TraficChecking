@@ -7,7 +7,17 @@ Main script to run the traffic violation detection system
 import argparse
 import os
 import sys
-from video_processor import VideoProcessor
+import platform
+
+# On Windows with very new Python versions numpy/OpenCV wheels can be incompatible
+# (e.g. numpy built with MINGW). Detect that early and provide actionable guidance.
+if sys.version_info >= (3, 13) and os.name == 'nt' and os.environ.get('SKIP_PYTHON_BINARY_IMPORTS', '0') != '1':
+    print(f"\nWARNING: Detected Python {platform.python_version()} on Windows.")
+    print("Some binary packages (numpy/OpenCV) may be built with MINGW and cause low-level errors.")
+    print("Recommended: run this project in Python 3.10 or 3.11 in a venv or conda environment.")
+    print("If you understand the risk and want to proceed, set SKIP_PYTHON_BINARY_IMPORTS=1 in environment.")
+    sys.exit(1)
+
 from config import Config
 
 def main():
@@ -22,14 +32,13 @@ def main():
     
     args = parser.parse_args()
     
-    # Import processor runtime to avoid heavy binary imports at module import time
+    # Import processor at runtime to surface import errors clearly (avoid NameError)
     try:
         from video_processor import VideoProcessor
     except Exception as e:
-        print("Error importing VideoProcessor (likely numpy/OpenCV/YOLO binary issue):")
+        print("Error: failed to import VideoProcessor (likely numpy/OpenCV/YOLO binary issue)")
         print(str(e))
-        print("Try running this project in Python 3.10 or 3.11 inside a virtualenv or conda.")
-        print("Or set SKIP_PYTHON_BINARY_IMPORTS=1 to bypass the Python version guard (not recommended).")
+        print("Fix: run this project in Python 3.10/3.11 inside a virtualenv or conda, or set SKIP_PYTHON_BINARY_IMPORTS=1 to bypass the version guard.")
         return 1
 
     # Initialize processor

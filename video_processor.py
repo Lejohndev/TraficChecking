@@ -31,6 +31,12 @@ class VideoProcessor:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Ensure detector uses correct FPS for speed calculations
+        try:
+            self.detector.config.FPS = fps
+        except Exception:
+            pass
         
         print(f"Processing video: {input_path}")
         print(f"Resolution: {width}x{height}, FPS: {fps}, Total frames: {total_frames}")
