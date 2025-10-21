@@ -7,26 +7,27 @@ from collections import defaultdict, deque
 from scipy.optimize import linear_sum_assignment
 import math
 import supervision as sv
-
+# usuing object detection model from ultralytics
 class TrafficViolationDetector:
     def __init__(self):
         self.config = Config()
         self.vehicle_model = YOLO(self.config.YOLO_MODEL)
         self.helmet_model = YOLO(self.config.HELMET_MODEL)
+        self.helmet_state = {}
   # Khởi tạo ByteTrack tracker (support multiple supervision versions)
         try:
             # Preferred/common signature
             self.tracker = sv.ByteTrack(
                 track_thresh=0.2,   # ngưỡng confidence để track
-                match_thresh=0.8,    # ngưỡng IOU matching
+                match_thresh=0.7,    # ngưỡng IOU matching
                 frame_rate=self.config.FPS
             )
         except TypeError:
             try:
                 # Alternate signatures seen in some versions
                 self.tracker = sv.ByteTrack(
-                     track_thresh=0.20,    # ngưỡng thấp hơn để không bỏ lỡ xe nhỏ xa
-                     match_thresh=0.9,     # yêu cầu IOU cao để tránh gán nhầm
+                     track_thresh=0.2,    # ngưỡng thấp hơn để không bỏ lỡ xe nhỏ xa
+                     match_thresh=0.7,     # yêu cầu IOU cao để tránh gán nhầm
                      track_buffer=90,      # giữ ID nếu YOLO mất detection tạm thời
                      frame_rate=self.config.FPS
 )
@@ -56,8 +57,32 @@ class TrafficViolationDetector:
         # Use very low confidence threshold to catch motorcycles
         min_conf = min(0.25, self.config.MOTORCYCLE_CONFIDENCE_THRESHOLD)
 
+        # Respect ROI from config: crop frame before detection to limit area
+        h, w = frame.shape[:2]
+        roi = getattr(self.config, 'ROI', (0.0, 0.35, 1.0, 0.95))
+        roi_relative = getattr(self.config, 'ROI_RELATIVE', True)
+        if roi_relative:
+            x1 = int(roi[0] * w)
+            y1 = int(roi[1] * h)
+            x2 = int(roi[2] * w)
+            y2 = int(roi[3] * h)
+        else:
+            x1, y1, x2, y2 = roi
+            # clamp
+            x1 = max(0, min(w - 1, int(x1)))
+            x2 = max(0, min(w, int(x2)))
+            y1 = max(0, min(h - 1, int(y1)))
+            y2 = max(0, min(h, int(y2)))
+
+        if x2 <= x1 or y2 <= y1:
+            roi_frame = frame
+            roi_offset = (0, 0)
+        else:
+            roi_frame = frame[y1:y2, x1:x2]
+            roi_offset = (x1, y1)
+
         # Tăng kích thước ảnh đầu vào để YOLO có thêm chi tiết
-        results = self.vehicle_model(frame, conf=0.25, imgsz=960)
+        results = self.vehicle_model(roi_frame, conf=0.25, imgsz=640)
         
         vehicles = []
         for result in results:
@@ -77,10 +102,15 @@ class TrafficViolationDetector:
                             if confidence < self.config.CONFIDENCE_THRESHOLD:
                                 continue
                         
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        bx1, by1, bx2, by2 = box.xyxy[0].cpu().numpy()
+                        # Map detection back to full-frame coordinates using roi_offset
+                        x1 = int(bx1 + roi_offset[0])
+                        y1 = int(by1 + roi_offset[1])
+                        x2 = int(bx2 + roi_offset[0])
+                        y2 = int(by2 + roi_offset[1])
                         
                         vehicles.append({
-                            'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                            'bbox': [x1, y1, x2, y2],
                             'confidence': confidence,
                             'class_id': class_id,
                             'class_name': self.config.VEHICLE_CLASSES[class_id]
@@ -88,45 +118,109 @@ class TrafficViolationDetector:
         
         return vehicles
     
-    def detect_helmets(self, frame, vehicle_bbox):
-        """Detect helmets in a vehicle region"""
-        x1, y1, x2, y2 = vehicle_bbox
-        vehicle_roi = frame[y1:y2, x1:x2]
-        
-        if vehicle_roi.size == 0:
-            return False
-        
-        # Expand ROI to better detect helmets
-        h, w = vehicle_roi.shape[:2]
-        expanded_roi = vehicle_roi[max(0, y1-20):min(frame.shape[0], y2+20), 
-                                  max(0, x1-20):min(frame.shape[1], x2+20)]
-        
-        if expanded_roi.size == 0:
-            return False
-            
-        # Use lower confidence for helmet detection
-        results = self.helmet_model(expanded_roi, conf=0.2)
-        
-        helmet_detected = False
-        person_detected = False
-        
-        for result in results:
-            boxes = result.boxes
-            if boxes is not None:
-                for box in boxes:
-                    class_id = int(box.cls[0])
-                    confidence = box.conf[0].cpu().numpy()
-                    
-                    if class_id == 0:  # person detected
-                        person_detected = True
-                    elif class_id == 1:  # helmet detected
-                        helmet_detected = True
-                    elif class_id == 2:  # no_helmet detected
-                        return False
-        
-        # If person is detected but no helmet, it's a violation
-        return person_detected and not helmet_detected
     
+    def get_head_region(self, bbox, frame_shape):
+        """Tính toán vùng đầu từ box xe máy - Cải thiện để chính xác hơn"""
+        x1, y1, x2, y2 = bbox
+        fh, fw = frame_shape[:2]
+        width = x2 - x1
+        height = y2 - y1
+
+        # Cải thiện tính toán vùng đầu - tập trung vào phần trên của xe máy
+        # Điều chỉnh để phù hợp với góc camera từ trên xuống
+        head_y1 = max(0, int(y1 - 0.4 * height))   # ↑ cao hơn một chút
+        head_y2 = int(y1 + 0.4 * height)           # ↓ lấy phần trên của xe
+
+        # Mở rộng vùng ngang một chút để không bỏ lỡ đầu
+        head_x1 = max(0, int(x1 + 0.1 * width))   # bó hẹp ít hơn
+        head_x2 = min(fw, int(x2 - 0.1 * width))
+        
+        # Đảm bảo vùng đầu có kích thước tối thiểu
+        min_width = 25
+        min_height = 255
+        if (head_x2 - head_x1) < min_width:
+            center_x = (head_x1 + head_x2) // 2
+            head_x1 = max(0, center_x - min_width // 2)
+            head_x2 = min(fw, center_x + min_width // 2)
+        if (head_y2 - head_y1) < min_height:
+            center_y = (head_y1 + head_y2) // 2
+            head_y1 = max(0, center_y - min_height // 2)
+            head_y2 = min(fh, center_y + min_height // 2)
+            
+        return [head_x1, head_y1, head_x2, head_y2]
+    def detect_helmets(self, frame, vehicle_bbox, draw=True):
+        """
+        Phát hiện Helmet / No Helmet trong vùng đầu người lái xe máy
+        và vẽ box kết quả trực tiếp lên khung hình.
+
+        Trả về:
+        - True: nếu phát hiện No Helmet hoặc không có Helmet
+        - False: nếu phát hiện có Helmet
+        """
+    # 1. Tính toán vùng đầu
+        head_bbox = self.get_head_region(vehicle_bbox, frame.shape)
+        hx1, hy1, hx2, hy2 = head_bbox
+
+    # 2. Crop ROI vùng đầu
+        roi = frame[hy1:hy2, hx1:hx2]
+        if roi.size == 0:
+            return False
+
+    # 3. Chạy model helmet.pt với confidence thấp hơn để tránh miss detection
+        results = self.helmet_model(roi, conf=0.3, imgsz=224)
+        has_helmet = False
+        has_no_helmet = False
+        helmet_confidence = 0.0
+        no_helmet_confidence = 0.0
+
+    # 4. Duyệt qua các detection
+
+        for result in results:
+            if result.boxes is None:
+                continue
+            for box in result.boxes:
+                cls = int(box.cls[0])
+                conf = float(box.conf[0])
+
+                bx1, by1, bx2, by2 = box.xyxy[0].cpu().numpy()
+
+            # Map box trở lại frame gốc
+                bx1 += hx1
+                bx2 += hx1
+                by1 += hy1
+                by2 += hy1
+
+                color = (0, 255, 0) if cls == 0 else (0, 0, 255)
+                label = f"{'Helmet' if cls == 0 else 'No Helmet'} {conf:.2f}"
+
+            # Vẽ box
+                if draw:
+                    cv2.rectangle(frame, (int(bx1), int(by1)), (int(bx2), int(by2)), color, 2)
+                    cv2.putText(frame, label, (int(bx1), int(by1) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                if cls == 0:
+                    has_helmet = True
+                    helmet_confidence = max(helmet_confidence, conf)
+                elif cls == 1:
+                    has_no_helmet = True
+                    no_helmet_confidence = max(no_helmet_confidence, conf)
+
+    # 5. Logic xác định vi phạm được cải thiện
+        if has_helmet and helmet_confidence > 0.4:
+             # Nếu phát hiện mũ bảo hiểm với confidence cao, không vi phạm
+             return False
+        
+        # Nếu phát hiện No Helmet với confidence cao
+        elif has_no_helmet and no_helmet_confidence > 0.4:
+             # Vi phạm rõ ràng
+             return True
+        
+        # Trường hợp không phát hiện thấy gì cả hoặc confidence thấp
+        else:
+             # Trả về False (KHÔNG VI PHẠM) để tránh false positive
+             # Chỉ báo vi phạm khi có bằng chứng rõ ràng
+             return False
     def detect_traffic_light(self, frame):
         """Simple traffic light detection based on color"""
         # Only check top portion of frame where traffic lights typically are
@@ -272,15 +366,23 @@ class TrafficViolationDetector:
                 # continue to centroid-based tracker below
                 pass
 
-        """Centroid-based tracker with persistence to reduce ID switching
-        and centroid smoothing using a short history to reduce jitter."""
-        # Build list of detections with centroids
-        detections = []  # (bbox, centroid, raw_vehicle)
+        """Centroid-based tracker with persistence and appearance + motion cues to reduce ID switching.
+        Uses simple histogram appearance matching, a lightweight Kalman-like predictor, and a short
+        deleted-track buffer for re-identification.
+        """
+        # Build list of detections with centroids and optional histograms
+        detections = []  # (bbox, centroid, raw_vehicle, hist)
         for vehicle in vehicles:
             x1, y1, x2, y2 = vehicle['bbox']
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2
-            detections.append((vehicle['bbox'], (cx, cy), vehicle))
+            hist = None
+            if frame is not None and 0 <= x1 < x2 and 0 <= y1 < y2:
+                try:
+                    hist = self.compute_histogram(frame, (x1, y1, x2, y2))
+                except Exception:
+                    hist = None
+            detections.append((vehicle['bbox'], (cx, cy), vehicle, hist))
 
         # Use Hungarian (optimal) assignment between predicted track centroids and detections
         matched_tracks = set()
@@ -289,70 +391,102 @@ class TrafficViolationDetector:
         if len(self.vehicle_tracks) > 0 and len(detections) > 0:
             track_ids = list(self.vehicle_tracks.keys())
 
-            # Build predicted centroids for each track using simple linear extrapolation from centroid history
+            # Predict centroids using either simple Kalman-like state or linear extrapolation
             predicted_centroids = []
             for tid in track_ids:
                 track = self.vehicle_tracks[tid]
-                hist = track.get('centroid_history')
-                if hist and len(hist) >= 2:
-                    last = hist[-1]
-                    prev = hist[-2]
-                    # velocity = last - prev, predict one-step ahead
-                    pred = (int(last[0] + (last[0] - prev[0])), int(last[1] + (last[1] - prev[1])))
+                kf = track.get('kalman')
+                if kf is not None:
+                    pred = (int(kf['x'] + kf.get('vx', 0)), int(kf['y'] + kf.get('vy', 0)))
                 else:
-                    # fallback to current centroid or center of bbox
-                    if 'centroid' in track and track['centroid'] is not None:
-                        pred = track['centroid']
+                    hist = track.get('centroid_history')
+                    if hist and len(hist) >= 2:
+                        last = hist[-1]
+                        prev = hist[-2]
+                        pred = (int(last[0] + (last[0] - prev[0])), int(last[1] + (last[1] - prev[1])))
                     else:
-                        bx = track.get('bbox') or [0, 0, 0, 0]
-                        pred = (int((bx[0] + bx[2]) / 2), int((bx[1] + bx[3]) / 2))
+                        if 'centroid' in track and track['centroid'] is not None:
+                            pred = track['centroid']
+                        else:
+                            bx = track.get('bbox') or [0, 0, 0, 0]
+                            pred = (int((bx[0] + bx[2]) / 2), int((bx[1] + bx[3]) / 2))
                 predicted_centroids.append(pred)
 
             det_centroids = [det[1] for det in detections]
+            det_hists = [det[3] for det in detections]
 
-            # Cost matrix: combine Euclidean distance and (1 - IoU) to prefer overlaps when available.
-            # Normalize distance by image diagonal to keep scale comparable to IoU term.
+            # Cost matrix: combine distance, IoU and appearance (histogram) similarity
             height, width = 1080, 1920
             diag = math.hypot(width, height)
             cost = np.zeros((len(predicted_centroids), len(det_centroids)), dtype=float)
             for i, p in enumerate(predicted_centroids):
                 for j, d in enumerate(det_centroids):
                     dist = np.hypot(p[0] - d[0], p[1] - d[1])
-                    # IoU between predicted bbox (use track bbox) and detection bbox if available
                     det_bbox = detections[j][0]
+                    det_hist = detections[j][3]
                     track_bbox = self.vehicle_tracks[track_ids[i]].get('bbox') if track_ids[i] in self.vehicle_tracks else None
                     iou_term = 1.0
                     if track_bbox is not None and det_bbox is not None:
                         iou_term = 1.0 - self.calculate_iou(track_bbox, det_bbox)
-                    # Combine normalized distance and IoU-term
-                    cost[i, j] = (dist / max(1.0, diag)) + iou_term
 
-            # Solve assignment
+                    # Appearance term via Bhattacharyya distance
+                    hist_term = 0.0
+                    track_hist = self.vehicle_tracks[track_ids[i]].get('hist')
+                    if det_hist is not None and track_hist is not None:
+                        try:
+                            bh = cv2.compareHist(track_hist, det_hist, cv2.HISTCMP_BHATTACHARYYA)
+                            hist_term = min(1.0, max(0.0, bh))
+                        except Exception:
+                            hist_term = 0.0
+
+                    # Weighted combination
+                    w_dist, w_iou, w_hist = 0.6, 0.25, 0.15
+                    cost[i, j] = (w_dist * (dist / max(1.0, diag))) + (w_iou * iou_term) + (w_hist * hist_term)
+
             row_ind, col_ind = linear_sum_assignment(cost)
 
             assigned_detections = set()
             assigned_tracks = set()
 
             for r, c in zip(row_ind, col_ind):
-                # convert combined cost back to a gating decision using distance alone
                 track_id = track_ids[r]
-                det_bbox, det_centroid, raw_vehicle = detections[c]
-                # compute actual euclidean distance for gating
+                det_bbox, det_centroid, raw_vehicle, det_hist = detections[c]
                 p = predicted_centroids[r]
                 d = det_centroids[c]
                 dist_px = np.hypot(p[0] - d[0], p[1] - d[1])
                 if dist_px <= self.config.MAX_TRACK_DISTANCE:
-                    # Update the matched track
+                    # Update matched track
                     track = self.vehicle_tracks[track_id]
                     track['bbox'] = det_bbox
                     if 'centroid_history' not in track:
                         cs_window = getattr(self.config, 'CENTROID_SMOOTHING_WINDOW', 5)
                         track['centroid_history'] = deque(maxlen=cs_window)
                     track['centroid_history'].append(det_centroid)
-                    hist = track['centroid_history']
-                    smoothed = (int(sum([c0[0] for c0 in hist]) / len(hist)), int(sum([c0[1] for c0 in hist]) / len(hist)))
+                    hist_ch = track['centroid_history']
+                    smoothed = (int(sum([c0[0] for c0 in hist_ch]) / len(hist_ch)), int(sum([c0[1] for c0 in hist_ch]) / len(hist_ch)))
                     track['centroid'] = smoothed
+                    # Update Kalman-like state
+                    if 'kalman' not in track:
+                        track['kalman'] = {'x': smoothed[0], 'y': smoothed[1], 'vx': 0.0, 'vy': 0.0}
+                    else:
+                        kf = track['kalman']
+                        vx = (smoothed[0] - kf['x'])
+                        vy = (smoothed[1] - kf['y'])
+                        kf['vx'] = 0.6 * kf.get('vx', 0.0) + 0.4 * vx
+                        kf['vy'] = 0.6 * kf.get('vy', 0.0) + 0.4 * vy
+                        kf['x'] = smoothed[0]
+                        kf['y'] = smoothed[1]
+                        track['kalman'] = kf
+                    # Update appearance
+                    if det_hist is not None:
+                        track['hist'] = det_hist
                     track['missing'] = 0
+                    track['hits'] = track.get('hits', 0) + 1
+                    if not track.get('confirmed', False) and track['hits'] >= getattr(self.config, 'TRACK_CONFIRMATION_FRAMES', 3):
+                        track['confirmed'] = True
+                    matched_tracks.add(track_id)
+                    assigned_detections.add(c)
+                    assigned_tracks.add(track_id)
                     track['class_name'] = raw_vehicle.get('class_name')
                     track['confidence'] = raw_vehicle.get('confidence')
                     track['raw'] = raw_vehicle
@@ -373,20 +507,25 @@ class TrafficViolationDetector:
             # No existing tracks: all detections are unmatched (create new tracks)
             unmatched_detections = detections[:]
 
-        # Create new tracks for unmatched detections
-        for det_bbox, det_centroid, raw_vehicle in unmatched_detections:
+        # Create new tracks for unmatched detections (each detection now has hist)
+        for det_bbox, det_centroid, raw_vehicle, det_hist in unmatched_detections:
             self.track_id_counter += 1
             cs_window = getattr(self.config, 'CENTROID_SMOOTHING_WINDOW', 5)
+            # New tracks start unconfirmed; require several hits to confirm to reduce churn
             self.vehicle_tracks[self.track_id_counter] = {
                 'bbox': det_bbox,
                 'centroid': det_centroid,
                 'centroid_history': deque([det_centroid], maxlen=cs_window),
                 'missing': 0,
+                'hits': 1,
+                'confirmed': False,
                 'positions': deque(maxlen=30),
                 'frame_numbers': deque(maxlen=30),
                 'class_name': raw_vehicle.get('class_name'),
                 'confidence': raw_vehicle.get('confidence'),
-                'raw': raw_vehicle
+                'raw': raw_vehicle,
+                'hist': det_hist,
+                'kalman': {'x': det_centroid[0], 'y': det_centroid[1], 'vx': 0.0, 'vy': 0.0}
             }
 
         # Increase missing frame count for unmatched tracks
@@ -394,16 +533,36 @@ class TrafficViolationDetector:
         for track_id, track in list(self.vehicle_tracks.items()):
             if track_id not in matched_tracks:
                 track['missing'] = track.get('missing', 0) + 1
+                # decay hits if missing for a frame (prevents confirming intermittent detections)
+                if track.get('missing', 0) > 0:
+                    track['hits'] = max(0, track.get('hits', 0) - 1)
             # Remove tracks that have been missing for too long
-            if track['missing'] > self.config.MAX_MISSING_FRAMES:
+            if track.get('missing', 0) > self.config.MAX_MISSING_FRAMES:
                 tracks_to_delete.append(track_id)
 
+        # Move deleted tracks into a short buffer for re-identification
+        if not hasattr(self, 'deleted_tracks'):
+            self.deleted_tracks = {}
         for tid in tracks_to_delete:
+            meta = self.vehicle_tracks.get(tid, {})
+            self.deleted_tracks[tid] = {
+                'hist': meta.get('hist'),
+                'hits': meta.get('hits', 0),
+                'confirmed': meta.get('confirmed', False),
+                'last_seen': time.time()
+            }
+            # limit buffer size
+            if len(self.deleted_tracks) > 50:
+                oldest = sorted(self.deleted_tracks.items(), key=lambda x: x[1].get('last_seen'))[0][0]
+                del self.deleted_tracks[oldest]
             del self.vehicle_tracks[tid]
 
         # Build return structure similar to previous interface: track_id -> raw vehicle info plus bbox
         current_tracks = {}
         for track_id, track in self.vehicle_tracks.items():
+            # Only expose confirmed tracks to reduce ID churn
+            if not track.get('confirmed', False):
+                continue
             # Ensure bbox is ints
             bbox = [int(v) for v in track['bbox']]
             current_tracks[track_id] = {
@@ -453,24 +612,65 @@ class TrafficViolationDetector:
                         'timestamp': time.time(),
                         'speed': speed
                     })
+                track_state['reported_red_light'] = True
+            # Check helmet violation for motorcycles and cars (in case of misclassification)
+            from collections import deque
+
+            # Kiểm tra mũ bảo hiểm cho xe máy và ô tô (trường hợp phân loại sai)
+            # Chỉ kiểm tra nếu xe có kích thước phù hợp với xe máy hoặc có người ngồi trên
+            should_check_helmet = False
             
-            # Check helmet violation for motorcycles
-            if class_name == 'motorcycle' and frame is not None:
+            if class_name == 'motorcycle':
+                should_check_helmet = True
+            elif class_name == 'car':
+                # Kiểm tra kích thước xe để xác định có thể là xe máy bị phân loại sai
+                x1, y1, x2, y2 = bbox
+                width = x2 - x1
+                height = y2 - y1
+                aspect_ratio = width / height if height > 0 else 0
+                
+                # Mở rộng điều kiện để bao gồm nhiều trường hợp xe máy bị phân loại sai
+                # Kiểm tra nếu xe có kích thước nhỏ (có thể là xe máy) hoặc có tỷ lệ khung hình phù hợp
+                is_small_vehicle = width < 150 and height < 150
+                is_motorcycle_like = aspect_ratio > 0.8 and aspect_ratio < 2.0 and width < 200 and height < 200
+                
+                if is_small_vehicle or is_motorcycle_like:
+                    should_check_helmet = True
+                    print(f"Detected potential motorcycle misclassified as car: ID {track_id}, size: {width}x{height}, ratio: {aspect_ratio:.2f}")
+            
+            if should_check_helmet and frame is not None:
+                if track_id not in self.helmet_state:
+                    # Sử dụng config để điều chỉnh buffer size
+                    self.helmet_state[track_id] = deque(maxlen=self.config.HELMET_BUFFER_SIZE)
+
                 try:
                     no_helmet = self.detect_helmets(frame, bbox)
-                    if no_helmet:
-                        violations.append({
+                    self.helmet_state[track_id].append(no_helmet)
+
+                    required_true_count = 15
+                     # Nếu maxlen=20
+                    if self.helmet_state[track_id].count(True) >= required_true_count:
+                  
+
+            # Kiểm tra nếu chưa báo trước đó
+
+                        already_reported = any(
+                            v['track_id'] == track_id and v['type'] == 'NO_HELMET'
+                            for v in self.violation_history
+                        )
+                        if not any(v['track_id'] == track_id and v['type'] == 'NO_HELMET' for v in self.violation_history):
+                            violations.append({
                             'type': 'NO_HELMET',
                             'description': self.config.VIOLATION_TYPES['NO_HELMET'],
                             'track_id': track_id,
                             'bbox': bbox,
                             'frame': frame_number,
                             'timestamp': time.time()
-                        })
+                })
                 except Exception as e:
-                    # Skip helmet detection if there's an error
                     print(f"Helmet detection error: {e}")
-                    pass
+
+               
             
             # Check speeding (only for vehicles with reliable speed data)
             speed = self.calculate_speed(track_id, bbox, frame_number)
@@ -550,7 +750,7 @@ class TrafficViolationDetector:
             cv2.rectangle(annotated_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, self.config.BOX_THICKNESS)
             
             # Draw label
-            label = f"{class_name} {confidence:.2f}"
+            label = f"ID:{track_id} {class_name} {confidence:.2f}"
             cv2.putText(annotated_frame, label, (bbox[0], bbox[1] - 10), 
             cv2.FONT_HERSHEY_SIMPLEX, self.config.FONT_SCALE, color, 2)
         

@@ -7,7 +7,7 @@ pip install -r requirements.txt
 
 echo.
 echo Downloading YOLO models...
-python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+python -c "from ultralytics import YOLO; YOLO('yolo12s.pt')"
 
 echo.
 echo Creating demo video...

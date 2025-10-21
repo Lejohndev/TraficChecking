@@ -46,7 +46,7 @@ def test_yolo_model():
         return True
     try:
         from ultralytics import YOLO
-        model = YOLO('yolov8n.pt')
+        model = YOLO('yolo12s.pt')
         print("✓ YOLO model loaded successfully")
         return True
     except Exception as e:
